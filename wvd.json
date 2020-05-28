@@ -12,7 +12,7 @@
 		},
 		"sku": {
 			"type": "string",
-			"defaultValue": "19h2-evd"
+			"defaultValue": "20H1-evd"
 		},
 		"version": {
 			"type": "string",
