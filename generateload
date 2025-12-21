@@ -1,0 +1,337 @@
+<# 
+Host Load Simulator (User-mode) for demos (Nerdio Real-Time Insights friendly)
+- Randomises CPU load, memory footprint, and disk IOPS over time
+- No admin rights required
+- Stop any time with Ctrl+C
+- Cleans up temp files on exit
+#>
+
+# =========================
+# CONFIG (edit these)
+# =========================
+$Config = @{
+    DurationSeconds = 300
+    StepSeconds     = 10        # faster changes = more obvious on charts
+
+    # CPU: hit more cores, keep it high
+    CpuThreadsMin   = 8
+    CpuThreadsMax   = 16
+    CpuLoadPctMin   = 75
+    CpuLoadPctMax   = 100
+
+    # Memory: enough to show pressure but not instantly OOM
+    MemMinMB        = 2048
+    MemMaxMB        = 8192
+
+    # Disk: premium SSD can take higher IOPS
+    IopsMin         = 5000
+    IopsMax         = 25000
+
+    # IO behaviour: smaller blocks = more IOPS visibility
+    DiskFileSizeMB  = 4096
+    BlockKB         = 8
+    ReadPercent     = 50
+    WarmupSeconds   = 2
+
+    # Safety caps (hard limits)
+    HardMaxCpuThreads = 32
+    HardMaxMemMB      = 32768
+    HardMaxIOPS       = 50000
+}
+# =========================
+
+
+# ----------------------------
+# Guardrails / sanitise
+# ----------------------------
+function ClampInt([int]$v, [int]$min, [int]$max) {
+    if ($v -lt $min) { return $min }
+    if ($v -gt $max) { return $max }
+    return $v
+}
+function RandInt([int]$min, [int]$max) {
+    if ($max -lt $min) { $t=$min; $min=$max; $max=$t }
+    Get-Random -Minimum $min -Maximum ($max + 1)
+}
+
+$Config.CpuThreadsMin = ClampInt $Config.CpuThreadsMin 0 $Config.HardMaxCpuThreads
+$Config.CpuThreadsMax = ClampInt $Config.CpuThreadsMax 0 $Config.HardMaxCpuThreads
+$Config.CpuLoadPctMin = ClampInt $Config.CpuLoadPctMin 0 100
+$Config.CpuLoadPctMax = ClampInt $Config.CpuLoadPctMax 0 100
+
+$Config.MemMinMB      = ClampInt $Config.MemMinMB 0 $Config.HardMaxMemMB
+$Config.MemMaxMB      = ClampInt $Config.MemMaxMB 0 $Config.HardMaxMemMB
+
+$Config.IopsMin       = ClampInt $Config.IopsMin 0 $Config.HardMaxIOPS
+$Config.IopsMax       = ClampInt $Config.IopsMax 0 $Config.HardMaxIOPS
+
+$Config.ReadPercent   = ClampInt $Config.ReadPercent 0 100
+$Config.BlockKB       = ClampInt $Config.BlockKB 4 1024
+
+
+# ----------------------------
+# Setup
+# ----------------------------
+$stop = [System.Threading.CancellationTokenSource]::new()
+$cpuWorkers = New-Object System.Collections.Generic.List[object]
+$memChunks  = New-Object System.Collections.Generic.List[byte[]]
+
+$tempDir = Join-Path $env:TEMP "HostLoadSim"
+New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+
+$ioPath = Join-Path $tempDir "io.bin"
+$stopSignal = Join-Path $tempDir "STOP.SIGNAL"
+$iopsFile   = "$ioPath.iops"
+
+$ioSizeBytes = [int64]$Config.DiskFileSizeMB * 1MB
+$blockBytes  = [int]$Config.BlockKB * 1KB
+if ($blockBytes -lt 4096) { $blockBytes = 4096 } # avoid tiny blocks
+
+Write-Host "== Host Load Simulator ==" -ForegroundColor Cyan
+Write-Host "Temp dir: $tempDir"
+Write-Host ("Runtime: {0}s | Step: {1}s | Warmup: {2}s" -f $Config.DurationSeconds, $Config.StepSeconds, $Config.WarmupSeconds)
+Write-Host ("CPU: threads {0}-{1}, load {2}-{3}% | MEM: {4}-{5}MB | Disk: ~{6}-{7} IOPS | Block: {8}KB | Read%: {9}" -f `
+    $Config.CpuThreadsMin, $Config.CpuThreadsMax, $Config.CpuLoadPctMin, $Config.CpuLoadPctMax, `
+    $Config.MemMinMB, $Config.MemMaxMB, $Config.IopsMin, $Config.IopsMax, $Config.BlockKB, $Config.ReadPercent)
+Write-Host "Press Ctrl+C to stop." -ForegroundColor Yellow
+Write-Host ""
+
+# Pre-create IO file
+if (-not (Test-Path $ioPath)) {
+    Write-Host "Creating IO file ($($Config.DiskFileSizeMB) MB)..."
+    $fs = [System.IO.File]::Open($ioPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+    try {
+        $fs.SetLength($ioSizeBytes)
+        $fs.Flush($true)
+    } finally {
+        $fs.Dispose()
+    }
+}
+
+# Ensure signals exist
+if (Test-Path $stopSignal) { Remove-Item $stopSignal -Force -ErrorAction SilentlyContinue }
+Set-Content -Path $iopsFile -Value "0" -Force
+
+# Ctrl+C handler
+[Console]::add_CancelKeyPress({
+    param($sender, $e)
+    $e.Cancel = $true
+    $script:stop.Cancel()
+    Write-Host "`nStopping..." -ForegroundColor Yellow
+})
+
+
+# ----------------------------
+# CPU Workers (duty-cycle)
+# ----------------------------
+$script:cpuLoadPct = 0
+
+function Start-CpuWorker {
+    param([System.Threading.CancellationToken]$token)
+    $run = {
+        param($tokenRef)
+
+        $periodMs = 200
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+        while (-not $tokenRef.IsCancellationRequested) {
+            $pct = [int]$script:cpuLoadPct
+            if ($pct -lt 0) { $pct = 0 }
+            if ($pct -gt 100) { $pct = 100 }
+
+            $busyMs = [int]([Math]::Floor($periodMs * ($pct / 100.0)))
+            $idleMs = $periodMs - $busyMs
+
+            if ($busyMs -gt 0) {
+                $end = $sw.ElapsedMilliseconds + $busyMs
+                while ($sw.ElapsedMilliseconds -lt $end -and -not $tokenRef.IsCancellationRequested) {
+                    [Math]::Sqrt((Get-Random -Minimum 1 -Maximum 1000000)) | Out-Null
+                }
+            }
+            if ($idleMs -gt 0) {
+                Start-Sleep -Milliseconds $idleMs
+            }
+        }
+    }
+
+    $ps = [PowerShell]::Create()
+    $ps.AddScript($run).AddArgument($token) | Out-Null
+    $handle = $ps.BeginInvoke()
+    [pscustomobject]@{ PS = $ps; Handle = $handle }
+}
+
+function Ensure-CpuWorkers([int]$count) {
+    $count = ClampInt $count 0 $Config.HardMaxCpuThreads
+    while ($cpuWorkers.Count -lt $count) {
+        $cpuWorkers.Add((Start-CpuWorker -token $stop.Token)) | Out-Null
+    }
+    while ($cpuWorkers.Count -gt $count) {
+        $w = $cpuWorkers[$cpuWorkers.Count - 1]
+        $cpuWorkers.RemoveAt($cpuWorkers.Count - 1)
+        try { $w.PS.Dispose() } catch {}
+    }
+}
+
+
+# ----------------------------
+# Memory allocator
+# ----------------------------
+function Get-HeldMemMB {
+    $sum = ($memChunks | ForEach-Object { $_.Length } | Measure-Object -Sum).Sum
+    if (-not $sum) { return 0 }
+    return [int]($sum / 1MB)
+}
+
+function Set-MemoryTargetMB([int]$targetMB) {
+    $targetMB = ClampInt $targetMB 0 $Config.HardMaxMemMB
+    $currentMB = Get-HeldMemMB
+
+    if ($targetMB -gt $currentMB) {
+        $toAddMB = $targetMB - $currentMB
+        while ($toAddMB -gt 0 -and -not $stop.IsCancellationRequested) {
+            $chunkMB = [Math]::Min(64, $toAddMB)
+            try {
+                $arr = New-Object byte[] ($chunkMB * 1MB)
+                for ($i=0; $i -lt $arr.Length; $i += 4096) { $arr[$i] = 1 } # commit pages
+                $memChunks.Add($arr) | Out-Null
+            } catch {
+                Write-Warning "Memory allocation failed. Holding at current."
+                break
+            }
+            $toAddMB -= $chunkMB
+        }
+    }
+    elseif ($targetMB -lt $currentMB) {
+        $toFreeMB = $currentMB - $targetMB
+        while ($toFreeMB -gt 0 -and $memChunks.Count -gt 0) {
+            $last = $memChunks[$memChunks.Count - 1]
+            $memChunks.RemoveAt($memChunks.Count - 1)
+            $toFreeMB -= [int]($last.Length / 1MB)
+        }
+        [GC]::Collect()
+    }
+}
+
+
+# ----------------------------
+# Disk IO worker (job + file-based target for reliability)
+# ----------------------------
+function Start-IoWorker {
+    $job = Start-Job -ScriptBlock {
+        param($path, $sizeBytes, $blockBytes, $readPercent, $stopSignalPath)
+
+        $rand = New-Object System.Random
+        $bufW = New-Object byte[] $blockBytes
+        $bufR = New-Object byte[] $blockBytes
+
+        $targetFile = "$path.iops"
+        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+        try {
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+            while (-not (Test-Path $stopSignalPath)) {
+                $target = 0
+                try {
+                    if (Test-Path $targetFile) {
+                        $target = [int](Get-Content -Path $targetFile -ErrorAction Stop | Select-Object -First 1)
+                    }
+                } catch { $target = 0 }
+
+                if ($target -le 0) { Start-Sleep -Milliseconds 200; continue }
+
+                # Pace approx to target ops/sec
+                $opsThisSecond = $target
+                $intervalMs = 1000.0 / $opsThisSecond
+                if ($intervalMs -lt 0.2) { $intervalMs = 0.2 }
+
+                $tStart = $sw.Elapsed.TotalMilliseconds
+                for ($i = 0; $i -lt $opsThisSecond; $i++) {
+                    if (Test-Path $stopSignalPath) { break }
+
+                    $offset = [int64]($rand.NextDouble() * ($sizeBytes - $blockBytes))
+                    $fs.Position = $offset
+
+                    $doRead = ($rand.Next(0,100) -lt $readPercent)
+                    if ($doRead) {
+                        $null = $fs.Read($bufR, 0, $bufR.Length)
+                    } else {
+                        $bufW[0] = [byte]$rand.Next(0,256)
+                        $fs.Write($bufW, 0, $bufW.Length)
+                    }
+
+                    $targetTime = $tStart + (($i+1) * $intervalMs)
+                    while ($sw.Elapsed.TotalMilliseconds -lt $targetTime) {
+                        Start-Sleep -Milliseconds 1
+                        if (Test-Path $stopSignalPath) { break }
+                    }
+                }
+            }
+        } finally {
+            $fs.Dispose()
+        }
+    } -ArgumentList $ioPath, $ioSizeBytes, $blockBytes, $Config.ReadPercent, $stopSignal
+
+    return $job
+}
+
+$ioJob = Start-IoWorker
+
+
+# ----------------------------
+# Run loop
+# ----------------------------
+$start = Get-Date
+$end   = $start.AddSeconds($Config.DurationSeconds)
+
+Write-Host "Warming up for $($Config.WarmupSeconds) seconds..."
+Start-Sleep -Seconds $Config.WarmupSeconds
+
+while ((Get-Date) -lt $end -and -not $stop.IsCancellationRequested) {
+
+    $cpuThreadsTarget = RandInt $Config.CpuThreadsMin $Config.CpuThreadsMax
+    $script:cpuLoadPct = RandInt $Config.CpuLoadPctMin $Config.CpuLoadPctMax
+    $memTargetMB = RandInt $Config.MemMinMB $Config.MemMaxMB
+    $iopsTarget  = RandInt $Config.IopsMin $Config.IopsMax
+
+    Ensure-CpuWorkers -count $cpuThreadsTarget
+    Set-MemoryTargetMB -targetMB $memTargetMB
+    Set-Content -Path $iopsFile -Value "$iopsTarget" -Force
+
+    $elapsed = [int]((Get-Date) - $start).TotalSeconds
+    $held = Get-HeldMemMB
+    Write-Host ("[{0,4}s] CPU: {1}% on {2} threads | MEM held: {3} MB | Disk: ~{4} IOPS (R:{5}%/W:{6}%)" -f `
+        $elapsed, $script:cpuLoadPct, $cpuThreadsTarget, $held, $iopsTarget, $Config.ReadPercent, (100-$Config.ReadPercent))
+
+    for ($s=0; $s -lt $Config.StepSeconds; $s++) {
+        if ($stop.IsCancellationRequested) { break }
+        Start-Sleep -Seconds 1
+    }
+}
+
+# ----------------------------
+# Cleanup
+# ----------------------------
+try {
+    $stop.Cancel()
+    Set-Content -Path $iopsFile -Value "0" -Force
+    New-Item -ItemType File -Path $stopSignal -Force | Out-Null
+
+    if ($ioJob) {
+        Stop-Job $ioJob -ErrorAction SilentlyContinue | Out-Null
+        Receive-Job $ioJob -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job $ioJob -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    foreach ($w in $cpuWorkers) {
+        try { $w.PS.Dispose() } catch {}
+    }
+
+    $memChunks.Clear()
+    [GC]::Collect()
+
+    Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "Done. Cleaned up." -ForegroundColor Green
+} catch {
+    Write-Warning "Cleanup hit an error: $_"
+    Write-Host "Temp files left at: $tempDir"
+}
