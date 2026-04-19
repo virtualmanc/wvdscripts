@@ -1,22 +1,14 @@
-<#
-.SYNOPSIS
-    Export Intune Device Configuration Policy Statuses via Microsoft Graph Reports API
-.DESCRIPTION
-    Uses the async export job pattern: POST to create, GET to poll, then download the ZIP/CSV
-.REQUIREMENTS
-    - Microsoft.Graph PowerShell SDK (or manual token acquisition)
-    - Permissions: DeviceManagementConfiguration.Read.All
-#>
-
 #region --- Configuration ---
 $TenantId     = ""
 $ClientId     = ""
 $ClientSecret = ""   # Use cert or managed identity in production
 $OutputPath   = "C:\Temp\IntuneReport"
-$PollInterval = 30      # seconds between polls
-$MaxAttempts  = 100     # max poll attempts
+$PollInterval = 30
+$MaxAttempts  = 100
 $BaseUrl      = "https://graph.microsoft.com/v1.0"
 #endregion
+
+$ScriptStart = Get-Date
 
 #region --- Step 0: Get Access Token ---
 Write-Host "[*] Acquiring access token..." -ForegroundColor Cyan
@@ -44,6 +36,8 @@ Write-Host "[+] Token acquired." -ForegroundColor Green
 #region --- Step 1: Create Export Job ---
 Write-Host "[*] Creating export job..." -ForegroundColor Cyan
 
+$JobStart = Get-Date
+
 $jobBody = @{
     reportName = "DeviceConfigurationPolicyStatuses"
     format     = "csv"
@@ -65,7 +59,6 @@ Write-Host "[*] Polling for job completion (every $PollInterval seconds, max $Ma
 $attempt   = 0
 $jobStatus = $null
 
-# Initial delay before first poll
 Start-Sleep -Seconds 1
 
 do {
@@ -81,11 +74,12 @@ do {
     Write-Host " Status: $jobStatus"
 
     if ($jobStatus -eq "completed") {
-        Write-Host "[+] Job completed successfully." -ForegroundColor Green
+        $JobDuration = (Get-Date) - $JobStart
+        Write-Host "[+] Job completed in $([math]::Round($JobDuration.TotalSeconds, 1))s." -ForegroundColor Green
         break
     }
     elseif ($jobStatus -eq "failed") {
-        Write-Error "[!] Export job failed. Check the job response for details."
+        Write-Error "[!] Export job failed."
         exit 1
     }
 
@@ -107,33 +101,39 @@ if (-not $downloadUrl) {
     exit 1
 }
 
-Write-Host "[*] Downloading report from returned URL..." -ForegroundColor Cyan
+Write-Host "[*] Downloading report..." -ForegroundColor Cyan
 
-# Ensure output directory exists
+$DownloadStart = Get-Date
+
 if (-not (Test-Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath | Out-Null
 }
 
 $zipPath = Join-Path $OutputPath "DeviceConfigPolicyStatuses_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
 
-# Note: Direct HTTPS download — NOT a Graph endpoint, no auth header needed
 Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
 
-Write-Host "[+] ZIP downloaded to: $zipPath" -ForegroundColor Green
+$DownloadDuration = (Get-Date) - $DownloadStart
+Write-Host "[+] Downloaded in $([math]::Round($DownloadDuration.TotalSeconds, 1))s — saved to: $zipPath" -ForegroundColor Green
 #endregion
 
 #region --- Step 4: Extract CSV ---
-Write-Host "[*] Extracting CSV from ZIP..." -ForegroundColor Cyan
+Write-Host "[*] Extracting CSV..." -ForegroundColor Cyan
 
 Expand-Archive -Path $zipPath -DestinationPath $OutputPath -Force
 
 $csvFiles = Get-ChildItem -Path $OutputPath -Filter "*.csv"
-Write-Host "[+] Extracted CSV file(s):" -ForegroundColor Green
+Write-Host "[+] Extracted:" -ForegroundColor Green
 $csvFiles | ForEach-Object { Write-Host "    $($_.FullName)" }
-
-# Optional: Load the CSV into a variable for further processing
-# $reportData = Import-Csv -Path $csvFiles[0].FullName
-# Write-Host "[*] Row count: $($reportData.Count)"
 #endregion
 
-Write-Host "`n[✓] Done." -ForegroundColor Green
+#region --- Summary ---
+$TotalDuration = (Get-Date) - $ScriptStart
+
+Write-Host "`n--- Timing Summary ---" -ForegroundColor Yellow
+Write-Host "  Export job duration : $([math]::Round($JobDuration.TotalSeconds, 1))s"
+Write-Host "  Download duration   : $([math]::Round($DownloadDuration.TotalSeconds, 1))s"
+Write-Host "  Total script time   : $([math]::Round($TotalDuration.TotalSeconds, 1))s"
+Write-Host "----------------------" -ForegroundColor Yellow
+Write-Host "[✓] Done." -ForegroundColor Green
+#endregion
