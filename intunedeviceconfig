@@ -1,0 +1,139 @@
+<#
+.SYNOPSIS
+    Export Intune Device Configuration Policy Statuses via Microsoft Graph Reports API
+.DESCRIPTION
+    Uses the async export job pattern: POST to create, GET to poll, then download the ZIP/CSV
+.REQUIREMENTS
+    - Microsoft.Graph PowerShell SDK (or manual token acquisition)
+    - Permissions: DeviceManagementConfiguration.Read.All
+#>
+
+#region --- Configuration ---
+$TenantId     = ""
+$ClientId     = ""
+$ClientSecret = ""   # Use cert or managed identity in production
+$OutputPath   = "C:\Temp\IntuneReport"
+$PollInterval = 30      # seconds between polls
+$MaxAttempts  = 100     # max poll attempts
+$BaseUrl      = "https://graph.microsoft.com/v1.0"
+#endregion
+
+#region --- Step 0: Get Access Token ---
+Write-Host "[*] Acquiring access token..." -ForegroundColor Cyan
+
+$tokenBody = @{
+    grant_type    = "client_credentials"
+    scope         = "https://graph.microsoft.com/.default"
+    client_id     = $ClientId
+    client_secret = $ClientSecret
+}
+
+$tokenResponse = Invoke-RestMethod `
+    -Method Post `
+    -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+    -Body $tokenBody
+
+$headers = @{
+    Authorization  = "Bearer $($tokenResponse.access_token)"
+    "Content-Type" = "application/json"
+}
+
+Write-Host "[+] Token acquired." -ForegroundColor Green
+#endregion
+
+#region --- Step 1: Create Export Job ---
+Write-Host "[*] Creating export job..." -ForegroundColor Cyan
+
+$jobBody = @{
+    reportName = "DeviceConfigurationPolicyStatuses"
+    format     = "csv"
+} | ConvertTo-Json
+
+$jobResponse = Invoke-RestMethod `
+    -Method Post `
+    -Uri "$BaseUrl/deviceManagement/reports/exportJobs" `
+    -Headers $headers `
+    -Body $jobBody
+
+$jobId = $jobResponse.id
+Write-Host "[+] Export job created. Job ID: $jobId" -ForegroundColor Green
+#endregion
+
+#region --- Step 2: Poll for Completion ---
+Write-Host "[*] Polling for job completion (every $PollInterval seconds, max $MaxAttempts attempts)..." -ForegroundColor Cyan
+
+$attempt   = 0
+$jobStatus = $null
+
+# Initial delay before first poll
+Start-Sleep -Seconds 1
+
+do {
+    $attempt++
+    Write-Host "    Attempt $attempt/$MaxAttempts — checking status..." -NoNewline
+
+    $pollResponse = Invoke-RestMethod `
+        -Method Get `
+        -Uri "$BaseUrl/deviceManagement/reports/exportJobs('$jobId')" `
+        -Headers $headers
+
+    $jobStatus = $pollResponse.status
+    Write-Host " Status: $jobStatus"
+
+    if ($jobStatus -eq "completed") {
+        Write-Host "[+] Job completed successfully." -ForegroundColor Green
+        break
+    }
+    elseif ($jobStatus -eq "failed") {
+        Write-Error "[!] Export job failed. Check the job response for details."
+        exit 1
+    }
+
+    if ($attempt -ge $MaxAttempts) {
+        Write-Error "[!] Max poll attempts reached without completion."
+        exit 1
+    }
+
+    Start-Sleep -Seconds $PollInterval
+
+} while ($true)
+#endregion
+
+#region --- Step 3: Download the Report ---
+$downloadUrl = $pollResponse.url
+
+if (-not $downloadUrl) {
+    Write-Error "[!] No download URL found in completed job response."
+    exit 1
+}
+
+Write-Host "[*] Downloading report from returned URL..." -ForegroundColor Cyan
+
+# Ensure output directory exists
+if (-not (Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath | Out-Null
+}
+
+$zipPath = Join-Path $OutputPath "DeviceConfigPolicyStatuses_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+
+# Note: Direct HTTPS download — NOT a Graph endpoint, no auth header needed
+Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
+
+Write-Host "[+] ZIP downloaded to: $zipPath" -ForegroundColor Green
+#endregion
+
+#region --- Step 4: Extract CSV ---
+Write-Host "[*] Extracting CSV from ZIP..." -ForegroundColor Cyan
+
+Expand-Archive -Path $zipPath -DestinationPath $OutputPath -Force
+
+$csvFiles = Get-ChildItem -Path $OutputPath -Filter "*.csv"
+Write-Host "[+] Extracted CSV file(s):" -ForegroundColor Green
+$csvFiles | ForEach-Object { Write-Host "    $($_.FullName)" }
+
+# Optional: Load the CSV into a variable for further processing
+# $reportData = Import-Csv -Path $csvFiles[0].FullName
+# Write-Host "[*] Row count: $($reportData.Count)"
+#endregion
+
+Write-Host "`n[✓] Done." -ForegroundColor Green
