@@ -111,10 +111,20 @@ if (-not (Test-Path $OutputPath)) {
 
 $zipPath = Join-Path $OutputPath "DeviceConfigPolicyStatuses_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
 
-Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath
+$downloadResponse = Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -PassThru -UseBasicParsing
 
 $DownloadDuration = (Get-Date) - $DownloadStart
-Write-Host "[+] Downloaded in $([math]::Round($DownloadDuration.TotalSeconds, 1))s — saved to: $zipPath" -ForegroundColor Green
+
+Write-Host "`n--- HTTP Response ---" -ForegroundColor Yellow
+Write-Host "  Status Code    : $($downloadResponse.StatusCode) $($downloadResponse.StatusDescription)"
+Write-Host "  Content Type   : $($downloadResponse.Headers['Content-Type'])"
+Write-Host "  Content Length : $($downloadResponse.Headers['Content-Length']) bytes"
+Write-Host "  File saved to  : $zipPath"
+Write-Host "--- Full Headers ---" -ForegroundColor Yellow
+$downloadResponse.Headers | Format-Table -AutoSize
+Write-Host "--------------------" -ForegroundColor Yellow
+
+Write-Host "[+] Downloaded in $([math]::Round($DownloadDuration.TotalSeconds, 1))s" -ForegroundColor Green
 #endregion
 
 #region --- Step 4: Extract CSV ---
