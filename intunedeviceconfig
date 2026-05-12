@@ -39,7 +39,8 @@ Write-Host "[*] Creating export job..." -ForegroundColor Cyan
 $JobStart = Get-Date
 
 $jobBody = @{
-    reportName = "DeviceConfigurationPolicyStatuses"
+  # reportName = "DeviceConfigurationPolicyStatuses"
+    reportName = "DeviceStatusesByConfigurationProfile"
     format     = "csv"
 } | ConvertTo-Json
 
@@ -145,5 +146,5 @@ Write-Host "  Export job duration : $([math]::Round($JobDuration.TotalSeconds, 1
 Write-Host "  Download duration   : $([math]::Round($DownloadDuration.TotalSeconds, 1))s"
 Write-Host "  Total script time   : $([math]::Round($TotalDuration.TotalSeconds, 1))s"
 Write-Host "----------------------" -ForegroundColor Yellow
-Write-Host "[✓] Done." -ForegroundColor Green
+Write-Host "[Done]" -ForegroundColor Green
 #endregion
